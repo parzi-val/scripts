@@ -1,0 +1,19 @@
+# --- secrets (NEVER commit) ---
+.env
+**/.env
+vars.md
+
+# --- vendored / third-party clones (own git history) ---
+OmniRoute/
+
+# --- build artifacts & binaries ---
+*.exe
+skills-rs/target/
+node_modules/
+
+# --- editor / OS junk ---
+*~
+*.un~
+.*.un~
+.DS_Store
+Thumbs.db
