@@ -18,7 +18,7 @@ Personal automation scripts and tools.
 
 - **`flatten.py`** — recursively bring all files in a directory tree up to the top level.
 - **`ppt2pdf.py`** — recursively convert PPTs in a directory to PDFs. Handy for [NotebookLM](https://notebooklm.google.com/).
-- **`md-rs/`** — `mdv`, renders markdown in the terminal with ANSI colors (headings by color, code, lists, quotes, links). `mdv file.md` or pipe via stdin. Source only; `cargo build --release`, then copy `target/release/mdv.exe` onto your PATH.
+- **`md-rs/`** — `mdv`, renders markdown in the terminal with ANSI colors (headings by color, code, lists, quotes, links). `mdv file.md` clears the screen and shows the file's path as a colored header; `-i` renders inline without clearing; or pipe via stdin. Source only; `cargo build --release`, then copy `target/release/mdv.exe` onto your PATH.
 
 ## setup
 

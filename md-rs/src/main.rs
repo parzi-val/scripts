@@ -1,7 +1,8 @@
 // mdv: render markdown in the terminal with ANSI colors.
-// Usage: mdv [file]   (reads stdin when no file is given)
+// Usage: mdv [-i] [file]   (reads stdin when no file is given)
+//   Clears the screen first; -i renders inline without clearing.
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -11,6 +12,8 @@ const UNDERLINE: &str = "\x1b[4m";
 const STRIKE: &str = "\x1b[9m";
 const CODE: &str = "\x1b[38;5;214m"; // orange
 const LINK: &str = "\x1b[34m";
+const PATH: &str = "\x1b[38;5;141m"; // lavender
+const FILE: &str = "\x1b[1;38;5;203m"; // bold coral
 
 fn heading_color(level: HeadingLevel) -> &'static str {
     match level {
@@ -125,12 +128,27 @@ fn render(md: &str) -> String {
 
 fn main() {
     let mut md = String::new();
-    match std::env::args().nth(1) {
-        Some(path) => md = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+    let (flags, files): (Vec<String>, Vec<String>) =
+        std::env::args().skip(1).partition(|a| a.starts_with('-'));
+    let inline = flags.iter().any(|f| f == "-i");
+    let path = files.into_iter().next();
+    match &path {
+        Some(path) => md = std::fs::read_to_string(path).unwrap_or_else(|e| {
             eprintln!("mdv: {path}: {e}");
             std::process::exit(1)
         }),
         None => { std::io::stdin().read_to_string(&mut md).unwrap(); }
+    }
+    // Clear screen + scrollback, cursor home. Skipped when piped so files stay clean.
+    if !inline && std::io::stdout().is_terminal() {
+        print!("\x1b[2J\x1b[3J\x1b[H");
+    }
+    // Header: "<dir> <file>", each underlined in its own color.
+    if let Some(path) = path {
+        let abs = std::path::absolute(&path).unwrap_or(path.into());
+        let dir = abs.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        let name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        println!("{UNDERLINE}{PATH}{dir}{RESET} {UNDERLINE}{FILE}{name}{RESET}\n");
     }
     // PowerShell pipes prepend a BOM, which would hide a leading "#"
     std::io::stdout().write_all(render(md.trim_start_matches('\u{feff}')).as_bytes()).unwrap();
