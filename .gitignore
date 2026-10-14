@@ -9,6 +9,7 @@ OmniRoute/
 # --- build artifacts & binaries ---
 *.exe
 skills-rs/target/
+md-rs/target/
 node_modules/
 
 # --- editor / OS junk ---
