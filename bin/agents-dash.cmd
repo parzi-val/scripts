@@ -1,1 +1,1 @@
-@python "%~dp0..\agents-dash.py" %*
+@python "%~dp0..\agents_dash.py" %*

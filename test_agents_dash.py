@@ -1,12 +1,9 @@
 """Checks for agents-dash parsing. Run: python test_agents_dash.py"""
-import importlib.util
 import json
 import os
 import tempfile
 
-spec = importlib.util.spec_from_file_location("ad", os.path.join(os.path.dirname(__file__), "agents-dash.py"))
-ad = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ad)
+import agents_dash as ad
 
 assert ad.clean("hi <system-reminder>x</system-reminder> there") == "hi there"
 assert ad.clean("<command-name>/btw</command-name><command-message>btw</command-message>"
