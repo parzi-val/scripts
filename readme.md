@@ -19,6 +19,7 @@ Personal automation scripts and tools.
 - **`flatten.py`** — recursively bring all files in a directory tree up to the top level.
 - **`ppt2pdf.py`** — recursively convert PPTs in a directory to PDFs. Handy for [NotebookLM](https://notebooklm.google.com/).
 - **`md-rs/`** — `mdv`, renders markdown in the terminal with ANSI colors (headings by color, code, lists, quotes, links, tables wrapped to the terminal width). `mdv file.md` clears the screen and shows the file's path as a colored header; `-i` renders inline without clearing; `-r` stays open and re-renders whenever the file changes (Ctrl+C to quit); or pipe via stdin. Source only; `cargo build --release`, then copy `target/release/mdv.exe` onto your PATH.
+- **`agents-dash.py`** — live local dashboard of running Claude sessions (Herdr panes and the Desktop app). Run `agents-dash` (launchers in `bin/`; needs Python + `psutil`) and it opens http://127.0.0.1:8790: one card per session with a busy/idle badge and how long, ID and resume-command copy buttons, folder, memory, owned workspace plan, last request and last reply, plus a collapsed list of named sessions from the last 7 days that aren't running. `--port N`, `--no-open`; JSON at `/api/sessions`. Read-only, localhost only; never exposes the session registry's key files, tokens or pipe paths. Checks: `python test_agents_dash.py`.
 
 ## setup
 
