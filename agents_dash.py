@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -184,18 +185,12 @@ def _proc_details(p):
             except psutil.Error:
                 pass
         parents = [q.name().lower() for q in p.parents()]
-        host = "Herdr" if "herdr.exe" in parents else "Desktop app" if "claude.exe" in parents else "terminal"
-        names = {}
-        for c in kids:
-            try:
-                names[c.name()] = names.get(c.name(), 0) + 1
-            except psutil.Error:
-                pass
+        host = "Herdr" if "herdr.exe" in parents else "Desktop app" if "claude.exe" in parents else "Terminal"
         return {
             "memMB": p.memory_info().rss >> 20,
             "childMemMB": kid_mem >> 20,
-            "children": [f"{n} ×{k}" if k > 1 else n for n, k in sorted(names.items())],
             "host": host,
+            "childCount": len(kids),
         }
     except psutil.Error:  # a child exited mid-walk; the session itself is still alive
         return {}
@@ -222,9 +217,42 @@ def resume_cmd(cwd, sid):
 
 # ---------- snapshot ----------
 
+def _msg(m, outgoing=False):
+    """Transcript request/reply -> the page's Message ({from, at, text}); None if missing."""
+    if not m:
+        return None
+    try:
+        at = datetime.fromisoformat(m["ts"].replace("Z", "+00:00")).timestamp() * 1000
+    except (KeyError, AttributeError, ValueError):
+        at = None
+    out = {"at": at, "text": m["text"]}
+    if not outgoing:
+        out["from"] = m.get("from") or "you"
+    return out
+
+
+def _session(name, sid, cwd, state, since, owners, tr, proc=None):
+    group, _, short = name.partition("-")
+    plans = owners.get(name, [])
+    return {
+        # Explicit whitelist: messagingSocketPath, keys and tokens never leave the server.
+        "name": name, "id": short or name, "group": group,
+        "state": state, "stateSince": since,
+        "folder": cwd, "sessionId": sid,
+        "runsIn": proc.get("host") if proc is not None else None,
+        "memoryMB": proc.get("memMB") if proc is not None else None,
+        "children": {"count": proc["childCount"], "memoryMB": proc["childMemMB"]}
+        if proc and proc.get("childCount") else None,
+        "workingOn": plans[0]["title"] if plans else None,
+        "lastIn": _msg(tr.get("request")), "lastOut": _msg(tr.get("reply"), True),
+        "resume": resume_cmd(cwd, sid),
+    }
+
+
 def snapshot():
+    """Session[] in the shape the page's loadSessions() documents."""
     owners = plans_by_owner()
-    running, live_ids = [], set()
+    out, live_ids = [], set()
     for f in glob.glob(os.path.join(SESSIONS, "*.json")):  # never *.key
         try:
             reg = json.load(open(f, encoding="utf-8"))
@@ -239,28 +267,22 @@ def snapshot():
         path = transcript_path(cwd, sid)
         tr = read_transcript(path) if path else {}
         name = reg.get("name") or (tr.get("names") or ["?"])[0]
-        running.append({
-            # Explicit whitelist: messagingSocketPath, keys and tokens never leave the server.
-            "name": name,
-            "sessionId": sid,
-            "cwd": cwd,
-            "entrypoint": reg.get("entrypoint"),
-            "status": reg.get("status") or "?",
-            "statusSince": reg.get("statusUpdatedAt") or reg.get("updatedAt"),
-            "startedAt": reg.get("startedAt"),
-            "version": reg.get("version"),
-            "otherNames": [n for n in tr.get("names", []) if n != name][:3],
-            "plans": owners.get(name, []),
-            "request": tr.get("request"),
-            "reply": tr.get("reply"),
-            "lastActivity": tr.get("mtime"),
-            "resume": resume_cmd(cwd, sid),
-            **proc,
-        })
-    rank = {"busy": 0, "shell": 1}
-    running.sort(key=lambda s: (rank.get(s["status"], 2), s["name"].lower()))
-    rec = recent(live_ids)
-    return {"now": time.time() * 1000, "running": running, "recent": rec, "recentReady": _recent_cache["at"] > 0}
+        state = "busy" if reg.get("status") == "busy" else "idle"
+        s = _session(name, sid, cwd, state, reg.get("statusUpdatedAt") or reg.get("updatedAt"), owners, tr, proc)
+        s["startedAt"] = reg.get("startedAt")
+        out.append(s)
+    # A manager that isn't running still gets a row, so it can be resumed from here.
+    if not any(s["group"] == "manager" for s in out):
+        r = next((r for r in recent(live_ids) if r["name"].partition("-")[0] == "manager"), None)
+        if r:
+            s = _session(r["name"], r["sessionId"], r["cwd"], "stopped", r["lastActivity"], owners, r["tr"])
+            s["startedAt"] = None
+            out.append(s)
+    # Two groups can share a short name (dev-lead, research-lead); fall back to the full name.
+    for s in out:
+        if sum(o["id"] == s["id"] for o in out) > 1:
+            s["id"] = s["name"]
+    return out
 
 
 _recent_cache = {"at": 0, "data": [], "scanning": False}
@@ -300,9 +322,8 @@ def _find_recent():
         tr = read_transcript(path)
         if not tr.get("names"):
             continue  # unnamed one-offs would drown the list
-        out.append({"name": tr["names"][0], "otherNames": tr["names"][1:3], "sessionId": sid,
-                    "cwd": tr.get("cwd"), "lastActivity": tr.get("mtime"), "request": tr.get("request"),
-                    "resume": resume_cmd(tr.get("cwd"), sid)})
+        out.append({"name": tr["names"][0], "sessionId": sid, "cwd": tr.get("cwd"),
+                    "lastActivity": tr.get("mtime"), "tr": tr})
     out.sort(key=lambda r: -(r["lastActivity"] or 0))
     return out
 
@@ -345,386 +366,688 @@ class Server(ThreadingHTTPServer):
 
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Claude sessions</title>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude sessions</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@400..700&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<style>
-  :root {
-    --paper: #F7F6F2; --card: #FFFFFF; --ink: #1F2328; --muted: #686C73; --faint: #8F939A;
-    --line: #E8E5DE; --inset: #F5F3EE;
-    --busy: #9A5C00; --busy-bg: #FFF0D2; --busy-dot: #E39A12; --busy-tint: #FFFCF6; --busy-line: #F1D9A8;
-    --live: #2F8F5B;
-    --sans: "Google Sans Flex", system-ui, -apple-system, "Segoe UI", sans-serif;
-    --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
-    --ease: cubic-bezier(.2, .75, .25, 1);
-    --shadow: 0 1px 2px rgba(31, 35, 40, .04), 0 6px 20px rgba(31, 35, 40, .045);
-    --shadow-busy: 0 1px 2px rgba(120, 75, 0, .06), 0 10px 30px rgba(160, 100, 0, .10);
-  }
-  * { box-sizing: border-box }
-  html { background: var(--paper) }
-  body { margin: 0; color: var(--ink); font: 15px/1.5 var(--sans); -webkit-font-smoothing: antialiased }
-  .mono { font-family: var(--mono); font-size: 12.5px; letter-spacing: -.01em }
-  .wrap { max-width: 1760px; margin: 0 auto; padding: 40px 40px 64px }
-
-  /* header */
-  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px 32px; flex-wrap: wrap;
-          margin-bottom: 28px }
-  h1 { font-size: 26px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 4px }
-  .counts { color: var(--muted); font-size: 15px }
-  .counts b { font-weight: 600; color: var(--ink) }
-  .counts .n-busy { color: var(--busy) }
-  .live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px }
-  .live .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live); animation: breathe 2.4s ease-in-out infinite }
-  .live.off .dot { background: var(--faint); animation: none }
-  .banner { display: none; margin: -12px 0 24px; padding: 12px 16px; border-radius: 12px; background: #FDECEC;
-            color: #8A1F1F; font-size: 14px }
-  .banner.show { display: block }
-
-  /* cards */
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); gap: 18px;
-          align-items: start }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 20px 22px 18px;
-          box-shadow: var(--shadow);
-          transition: background-color .5s var(--ease), border-color .5s var(--ease), box-shadow .5s var(--ease) }
-  .card.busy { background: var(--busy-tint); border-color: var(--busy-line); box-shadow: var(--shadow-busy) }
-  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px }
-  .name { font-size: 18px; font-weight: 620; letter-spacing: -.01em; margin: 0; overflow-wrap: anywhere }
-  .pill { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px 4px 9px;
-          border-radius: 999px; background: #F0EFEB; color: var(--muted); font-size: 13px; font-weight: 550;
-          transition: background-color .5s var(--ease), color .5s var(--ease) }
-  .pill .dot { position: relative; width: 7px; height: 7px; border-radius: 50%; background: #A3A7AD;
-               transition: background-color .5s var(--ease) }
-  .pill .time { font-family: var(--mono); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums }
-  .pill.busy { background: var(--busy-bg); color: var(--busy) }
-  .pill.busy .dot { background: var(--busy-dot) }
-  .pill.busy .dot::after { content: ""; position: absolute; inset: -4px; border-radius: 50%;
-                           border: 2px solid var(--busy-dot); opacity: 0; animation: ping 1.8s var(--ease) infinite }
-
-  .facts { display: grid; grid-template-columns: 92px 1fr; gap: 5px 14px; margin: 0 0 16px; font-size: 13px }
-  .facts dt { color: var(--muted) }
-  .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12.5px;
-              padding-top: 1px }
-  .facts .sans { font-family: var(--sans); font-size: 13px; padding-top: 0 }
-  .facts .soft { color: var(--muted) }
-
-  .brief { display: grid; gap: 8px }
-  .plan { font-size: 14px; line-height: 1.4 }
-  .plan .lead { color: var(--muted) }
-  .plan .state { color: var(--muted); font-size: 13px; margin-left: 6px; white-space: nowrap }
-  .snip { display: block; width: 100%; text-align: left; border: 0; border-radius: 12px; background: var(--inset);
-          padding: 10px 12px; color: var(--ink); cursor: pointer; font: inherit;
-          transition: background-color .2s var(--ease) }
-  .snip:hover { background: #EFEDE6 }
-  .snip .who { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12.5px;
-               margin-bottom: 3px }
-  .snip .text { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
-                font-family: var(--mono); font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere;
-                white-space: pre-wrap }
-  .snip.open .text { display: block }
-  .empty-brief { color: var(--faint); font-size: 13px }
-
-  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px }
-  button.copy { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 9px;
-                padding: 6px 12px; font: 500 13px var(--sans); cursor: pointer;
-                transition: background-color .2s var(--ease), border-color .2s var(--ease), color .2s var(--ease) }
-  button.copy:hover { border-color: #CFCBC2 }
-  button.copy.done { background: var(--ink); border-color: var(--ink); color: #fff }
-  button.copy.fail { border-color: #D9A0A0; color: #8A1F1F }
-  .note { color: var(--faint); font-size: 12.5px }
-  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px }
-
-  .empty { grid-column: 1 / -1; padding: 48px 0; color: var(--muted); text-align: center }
-
-  /* recent */
-  .recent { margin-top: 40px; border-top: 1px solid var(--line); padding-top: 8px }
-  .recent > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 10px;
-                      padding: 12px 0; font-size: 17px; font-weight: 600 }
-  .recent > summary::-webkit-details-marker { display: none }
-  .recent > summary .count { color: var(--muted); font-weight: 400; font-size: 14px }
-  .recent > summary .chev { display: inline-block; color: var(--muted); transition: transform .3s var(--ease) }
-  .recent[open] > summary .chev { transform: rotate(90deg) }
-  .rows { background: var(--card); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
-          overflow: hidden }
-  .row { display: grid; grid-template-columns: minmax(180px, 240px) 1fr auto; gap: 6px 20px; align-items: center;
-         padding: 14px 20px; border-top: 1px solid var(--line) }
-  .row:first-child { border-top: 0 }
-  .row .rname { font-weight: 600; overflow-wrap: anywhere }
-  .row .rmeta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere }
-  .row .rreq { color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0 }
-  .row .actions { margin-top: 0; flex-wrap: nowrap }
-
-  @keyframes breathe { 50% { opacity: .35 } }
-  @keyframes ping { 0% { transform: scale(.6); opacity: .55 } 80%, 100% { transform: scale(1.6); opacity: 0 } }
-
-  @media (max-width: 720px) {
-    .wrap { padding: 24px 16px 48px }
-    h1 { font-size: 22px }
-    .card { padding: 18px 16px 16px; border-radius: 16px }
-    .facts { grid-template-columns: 84px 1fr }
-    .row { grid-template-columns: 1fr; padding: 14px 16px }
-    .row .rreq { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical }
-    .row .actions { flex-wrap: wrap }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation: none !important; transition: none !important }
-  }
-</style></head><body>
-<div class="wrap">
-  <header class="head">
-    <div>
-      <h1>Claude sessions</h1>
-      <div class="counts" id="counts">Looking for running sessions…</div>
-    </div>
-    <div class="live" id="live"><span class="dot"></span><span id="liveText">Connecting</span></div>
-  </header>
-  <div class="banner" id="banner" role="alert"></div>
-  <main class="grid" id="grid" aria-live="polite"></main>
-  <details class="recent" id="recentBox">
-    <summary><span class="chev" aria-hidden="true">›</span><span>Recent sessions, not running</span>
-      <span class="count" id="recentCount"></span></summary>
-    <div class="rows" id="recent"></div>
-  </details>
-</div>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&family=JetBrains+Mono:wght@400;500&display=swap">
 <script>
-const $ = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
-  if (text != null) e.textContent = text; return e; };
-const setText = (el, v) => { v = v == null ? "" : String(v); if (el.textContent !== v) el.textContent = v; };
-const reduce = matchMedia("(prefers-reduced-motion: reduce)");
-const grid = document.getElementById("grid");
-const pad = n => String(n).padStart(2, "0");
-const ts = v => typeof v === "string" ? Date.parse(v) : v;
-
-// "4 min", "2.5 h": for things that change slowly. clock(): busy timer, ticks every second.
-function span(ms) {
-  if (!ms && ms !== 0) return "?";
-  const s = Math.max(0, ms / 1000);
-  if (s < 60) return Math.floor(s) + " s";
-  if (s < 3600) return Math.floor(s / 60) + " min";
-  if (s < 86400) { const h = s / 3600; return (h < 10 ? h.toFixed(1).replace(".0", "") : Math.round(h)) + " h"; }
-  return Math.floor(s / 86400) + " d";
-}
-function clock(ms) {
-  const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
-  return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
-}
-const since = t => t ? span(Date.now() - t) : "?";
-const statusName = s => ({ busy: "Busy", idle: "Idle", shell: "Shell" })[s] || (s ? s[0].toUpperCase() + s.slice(1) : "?");
-
-// Clipboard API first; if it's missing, fails or stalls (e.g. behind a pending permission prompt),
-// fall back to the selection-based copy so the button always ends in "Copied" or "Copy failed".
-async function writeClipboard(text) {
-  try {
-    await Promise.race([navigator.clipboard.writeText(text),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 800))]);
-  } catch {
-    const ta = $("textarea"); ta.value = text; ta.readOnly = true;
-    ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
-    document.body.append(ta); ta.select();
-    const ok = document.execCommand("copy"); ta.remove();
-    if (!ok) throw new Error("copy failed");
-  }
-}
-
-function copyButton(label) {
-  const b = $("button", "copy", label); b.type = "button";
-  b.onclick = async () => {
-    clearTimeout(b._t);
-    try { await writeClipboard(b.dataset.value); b.classList.add("done"); b.textContent = "Copied ✓"; }
-    catch { b.classList.add("fail"); b.textContent = "Copy failed"; }
-    b._t = setTimeout(() => { b.classList.remove("done", "fail"); b.textContent = label; }, 1400);
-  };
-  return b;
-}
-
-function snippet() {
-  const b = $("button", "snip"); b.type = "button"; b.setAttribute("aria-expanded", "false");
-  const who = $("span", "who"); const label = $("span"); const when = $("span", "mono");
-  who.append(label, when); const text = $("span", "text"); b.append(who, text);
-  b.onclick = () => flip(() => { const open = b.classList.toggle("open"); b.setAttribute("aria-expanded", open); });
-  return { el: b, label, when, text };
-}
-
-// One card per session, built once and then updated in place so nothing flickers.
-function makeCard() {
-  const el = $("article", "card");
-  const top = $("div", "top"), name = $("h2", "name"), pill = $("span", "pill");
-  const dot = $("span", "dot"), pillText = $("span"), pillTime = $("span", "time");
-  pill.append(dot, pillText, pillTime); top.append(name, pill);
-  const facts = $("dl", "facts"); const f = {};
-  for (const [key, label, sans] of [["folder", "Folder"], ["id", "Session"], ["via", "Runs in", 1],
-       ["up", "Running for", 1], ["mem", "Memory", 1], ["aka", "Also named", 1]]) {
-    const dt = $("dt", null, label), dd = $("dd", sans ? "sans" : null);
-    facts.append(dt, dd); f[key] = { dt, dd };
-  }
-  const brief = $("div", "brief");
-  const plans = $("div"); const req = snippet(), reply = snippet(); const none = $("div", "empty-brief", "No messages yet");
-  brief.append(plans, req.el, reply.el, none);
-  const actions = $("div", "actions");
-  const copyId = copyButton("Copy ID"), copyResume = copyButton("Copy resume command");
-  const note = $("span", "note");
-  actions.append(copyId, copyResume, note);
-  el.append(top, facts, brief, actions);
-  return { el, name, pill, pillText, pillTime, f, plans, req, reply, none, copyId, copyResume, note, data: null };
-}
-
-function showFact(row, value) {
-  const has = value != null && value !== "";
-  row.dt.hidden = row.dd.hidden = !has;
-  if (has) setText(row.dd, value);
-}
-
-function updateCard(c, s) {
-  c.data = s;
-  const st = ["busy", "idle", "shell"].includes(s.status) ? s.status : "other";
-  c.el.classList.toggle("busy", st === "busy");
-  c.pill.className = "pill " + st;
-  setText(c.name, s.name);
-  setText(c.pillText, statusName(s.status));
-  showFact(c.f.folder, s.cwd || "?");
-  showFact(c.f.id, s.sessionId.slice(0, 8) + "…");
-  c.f.id.dd.title = s.sessionId;
-  showFact(c.f.via, s.host || (s.entrypoint === "claude-desktop" ? "Desktop app" : "Terminal"));
-  let mem = s.memMB != null ? s.memMB + " MB" : "";
-  if (s.childMemMB) mem += ` plus ${s.childMemMB} MB in ${(s.children || []).length || "its"} child process${(s.children || []).length === 1 ? "" : "es"}`;
-  showFact(c.f.mem, mem);
-  c.f.mem.dd.title = (s.children || []).join(", ");
-  showFact(c.f.aka, (s.otherNames || []).join(", "));
-
-  const planKey = JSON.stringify(s.plans || []);
-  if (c.plans.dataset.key !== planKey) {
-    c.plans.dataset.key = planKey;
-    c.plans.replaceChildren(...(s.plans || []).map(p => {
-      const d = $("div", "plan"); d.append($("span", "lead", "Working on "), $("span", null, p.title), $("span", "state", (p.status || "").replace("-", " ")));
-      return d;
-    }));
-  }
-  fillSnip(c.req, s.request && (s.request.from ? "Message from " + s.request.from : "Asked"),
-           s.request && s.request.text, s.request && ts(s.request.ts));
-  fillSnip(c.reply, s.reply && "Replied", s.reply && s.reply.text, s.reply && ts(s.reply.ts));
-  c.none.hidden = !!(s.request || s.reply);
-
-  c.copyId.dataset.value = s.sessionId;
-  c.copyResume.dataset.value = s.resume;
-  setText(c.note, s.entrypoint === "claude-desktop" ? "Lives in the Desktop app" : "");
-  tickCard(c);
-}
-
-function fillSnip(sn, label, text, t) {
-  sn.el.hidden = !text;
-  if (!text) return;
-  setText(sn.label, label); setText(sn.text, text);
-  sn.t = t; setText(sn.when, t ? since(t) + " ago" : "");
-}
-
-function tickCard(c) {
-  const s = c.data; if (!s) return;
-  const t = ts(s.statusSince);
-  setText(c.pillTime, !t ? "" : s.status === "busy" ? clock(Date.now() - t) : "for " + span(Date.now() - t));
-  setText(c.f.up.dd, since(s.startedAt));
-  for (const sn of [c.req, c.reply]) if (sn.t) setText(sn.when, since(sn.t) + " ago");
-}
-
-// FLIP: measure, change the DOM, then glide every card from its old spot to its new one.
-function flip(mutate) {
-  const before = new Map([...grid.children].map(e => [e, e.getBoundingClientRect()]));
-  mutate();
-  if (reduce.matches) return;
-  for (const e of grid.children) {
-    const b = before.get(e); if (!b) continue;
-    const a = e.getBoundingClientRect(), dx = b.left - a.left, dy = b.top - a.top;
-    if (Math.abs(dx) > .5 || Math.abs(dy) > .5)
-      e.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
-                { duration: 450, easing: "cubic-bezier(.2, .75, .25, 1)" });
-  }
-}
-
-const cards = new Map();
-let firstRender = true;
-
-function render(list) {
-  const entering = [];
-  flip(() => {
-    const seen = new Set();
-    for (const s of list) {
-      let c = cards.get(s.sessionId);
-      if (!c) { c = makeCard(); cards.set(s.sessionId, c); entering.push(c.el); }
-      updateCard(c, s); seen.add(s.sessionId);
+  // Set the theme before first paint: saved choice, else the OS preference.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('sessions-theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') {
+      t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
-    for (const [id, c] of cards) if (!seen.has(id)) { cards.delete(id); leave(c.el); }
-    const want = list.map(s => cards.get(s.sessionId).el);
-    const have = [...grid.children].filter(e => !e.dataset.leaving);
-    if (want.length !== have.length || want.some((e, i) => have[i] !== e)) want.forEach(e => grid.append(e));
-    grid.querySelector(".empty")?.remove();
-    if (!list.length) grid.append($("div", "empty", "No Claude sessions are running right now."));
+    document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
+<style>
+/* ------------------------------------------------------------------
+   Design tokens. Two neutral greys per theme + one accent:
+   light = orange, dark = sky blue. The accent only marks "busy"
+   and the live dot; everything else stays monochrome.
+   ------------------------------------------------------------------ */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fcfcfc;
+  --sidebar: #f5f5f6;
+  --surface: #ffffff;
+  --raised: #f7f7f8;
+  --hover: #efeff1;
+  --sel: #e9e9ec;
+  --line: #e9e9eb;
+  --line-strong: #dcdce0;
+  --ink: #1c1c1f;
+  --muted: #5e5e66;
+  --label: #6b6b74;
+  --idle: #8b8b93;
+  --chip-bg: #f0f0f2;
+  --chip-ink: #3b3b41;
+  --accent: #e2730f;
+  --accent-ink: #a9500b;
+  --accent-bg: #fdf1e4;
+  --avatar: #ececef;
+  --in-bg: #ffffff;
+  --out-bg: #f3f3f5;
+  --out-line: #f3f3f5;
+  --pri-bg: #1c1c1f;
+  --pri-ink: #ffffff;
+  --sec-bg: #ffffff;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f0f10;
+  --sidebar: #0a0a0b;
+  --surface: #151516;
+  --raised: #19191b;
+  --hover: #1a1a1c;
+  --sel: #1f1f22;
+  --line: #232326;
+  --line-strong: #2f2f33;
+  --ink: #ededef;
+  --muted: #a1a1a8;
+  --label: #8b8b93;
+  --idle: #8b8b93;
+  --chip-bg: #1f1f22;
+  --chip-ink: #d4d4d8;
+  --accent: #6ec3f2;
+  --accent-ink: #96d4f7;
+  --accent-bg: #13212a;
+  --avatar: #26262a;
+  --in-bg: #151516;
+  --out-bg: #1e1e21;
+  --out-line: #2a2a2e;
+  --pri-bg: #ededef;
+  --pri-ink: #0f0f10;
+  --sec-bg: #151516;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace; }
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 6px; }
+
+/* ---------- Shell ---------- */
+.app { min-height: 100vh; display: flex; flex-wrap: wrap; align-items: stretch; }
+.sidebar {
+  flex: 1 1 264px; min-width: 0;
+  background: var(--sidebar); border-right: 1px solid var(--line);
+  padding: 8px 8px 24px; display: flex; flex-direction: column; gap: 14px;
+}
+.main { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; }
+@media (min-width: 900px) {
+  .app { flex-wrap: nowrap; }
+  .sidebar { flex: 0 0 264px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+}
+
+/* ---------- Sidebar ---------- */
+.brand { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px; }
+.brand-name { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--label); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+.nav-link { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 10px; border-radius: 8px; font-weight: 500; }
+.nav-link:hover { background: var(--hover); }
+.nav-link[aria-current="page"] { background: var(--sel); }
+
+.nav-group { display: flex; flex-direction: column; gap: 1px; }
+.nav-group-head { display: flex; justify-content: space-between; align-items: baseline; padding: 4px 10px; font-size: 12px; font-weight: 500; color: var(--label); }
+.nav-group-head .mono { font-size: 11px; }
+.nav-item {
+  display: grid; grid-template-columns: 14px minmax(0, 1fr) auto;
+  column-gap: 10px; row-gap: 2px; align-items: center;
+  min-height: 48px; padding: 7px 10px; border-radius: 8px;
+}
+.nav-item:hover { background: var(--hover); }
+.nav-item[aria-current="page"] { background: var(--sel); }
+.nav-item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nav-item .time { font-size: 11px; color: var(--label); }
+.nav-item .preview { grid-column: 2 / 4; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- Status icons ---------- */
+.si { display: block; flex: 0 0 auto; }
+.si-busy { color: var(--accent); }
+.si-idle, .si-stopped { color: var(--idle); }
+.si-busy .core { animation: breathe 2s ease-in-out infinite; }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@media (prefers-reduced-motion: reduce) { .si-busy .core { animation: none; } }
+.is-busy { color: var(--accent-ink) !important; }
+
+/* ---------- Top bar ---------- */
+.topbar {
+  min-height: 52px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 4px 16px; padding: 4px clamp(16px, 2.5vw, 28px); border-bottom: 1px solid var(--line);
+}
+.crumbs { display: flex; align-items: center; gap: 2px; min-width: 0; font-size: 13px; }
+.crumbs a { color: var(--muted); padding: 4px 6px; border-radius: 6px; }
+.crumbs a:hover { color: var(--ink); background: var(--hover); }
+.crumbs .sep { color: var(--label); display: flex; }
+.crumbs .dim { color: var(--muted); padding: 4px 6px; }
+.crumbs .here { font-weight: 500; padding: 4px 6px; }
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+.counts { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
+.counts > span { display: inline-flex; align-items: center; gap: 6px; }
+.counts b { color: var(--ink); font-weight: 500; }
+.icon-btn {
+  width: 30px; height: 30px; display: grid; place-items: center; padding: 0; cursor: pointer;
+  border: 1px solid var(--line-strong); border-radius: 7px; background: var(--sec-bg); color: var(--muted);
+}
+.icon-btn:hover { color: var(--ink); background: var(--hover); }
+
+/* ---------- Page ---------- */
+.content { padding: clamp(20px, 3vw, 36px) clamp(16px, 2.5vw, 28px) 48px; }
+.page { max-width: 1120px; display: flex; flex-direction: column; gap: 24px; }
+.h1 { margin: 0; font-size: 22px; line-height: 1.2; font-weight: 600; letter-spacing: -0.015em; }
+.sub { margin: 4px 0 0; color: var(--muted); }
+.label { margin: 0; display: flex; align-items: baseline; gap: 8px; font-size: 12px; font-weight: 500; color: var(--label); }
+.label .mono { font-size: 11px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.cols { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+.col-main { flex: 3 1 460px; min-width: 0; display: flex; flex-direction: column; gap: 24px; }
+.col-side { flex: 2 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.section { display: flex; flex-direction: column; gap: 10px; }
+.empty { padding: 16px; color: var(--muted); }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 30px; padding: 0 11px; border-radius: 7px; cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--line-strong); background: var(--sec-bg); color: var(--ink);
+  font-size: 12.5px; font-weight: 500;
+}
+.btn:hover { background: var(--hover); }
+.btn-primary { background: var(--pri-bg); border-color: var(--pri-bg); color: var(--pri-ink); }
+.btn-primary:hover { background: var(--pri-bg); opacity: 0.88; }
+.btn-block { width: 100%; height: 32px; }
+@media (pointer: coarse) {
+  .btn, .btn-block { height: 44px; }
+  .nav-link { min-height: 44px; }
+  .icon-btn { width: 44px; height: 44px; }
+}
+
+/* ---------- Home: not-running banner ---------- */
+.banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 8px 8px 8px 14px; }
+.banner-text { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.banner-text .dim { color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---------- Home: working now ---------- */
+.work-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 10px; }
+.work-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; transition: border-color 0.12s; }
+.work-card:hover { border-color: var(--line-strong); }
+.work-top { display: flex; align-items: center; gap: 8px; }
+.work-top .name { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.work-top .timer { font-size: 12px; }
+.meta { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 11.5px; color: var(--muted); }
+.last { display: flex; flex-direction: column; gap: 3px; padding-top: 10px; border-top: 1px solid var(--line); }
+.last-head { font-size: 12px; color: var(--muted); }
+.last-head b { color: var(--ink); font-weight: 500; }
+.clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* ---------- Home: groups as rows ---------- */
+.groups { overflow: hidden; }
+.group + .group { border-top: 1px solid var(--line); }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 14px; background: var(--raised); }
+.group-head .name { font-weight: 600; }
+.group-head .count { font-size: 11px; color: var(--label); margin-left: 8px; }
+.group-head .summary { font-size: 12px; color: var(--muted); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 12px; min-height: 40px; padding: 6px 14px; border-top: 1px solid var(--line); }
+.row:hover { background: var(--hover); }
+.row-name { flex: 1 1 160px; min-width: 0; display: flex; align-items: center; gap: 10px; }
+.row-name span { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-meta { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; font-size: 11.5px; color: var(--muted); }
+.row-meta > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.w-runs { width: 84px; } .w-up { width: 60px; } .w-mem { width: 58px; } .w-state { width: 72px; text-align: right; }
+
+/* ---------- Home: recent activity ---------- */
+.feed { list-style: none; margin: 0; padding: 0; overflow: hidden; }
+.feed li + li { border-top: 1px solid var(--line); }
+.feed a { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; align-items: start; padding: 10px 14px; }
+.feed a:hover { background: var(--hover); }
+.feed .ago { padding-top: 1px; font-size: 11.5px; color: var(--label); }
+.feed .body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.feed .who { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.feed .who b { font-weight: 500; }
+.feed .who i { font-style: normal; color: var(--muted); }
+.feed .text { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- Session ---------- */
+.title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 500; background: var(--chip-bg); color: var(--chip-ink); }
+.chip .mono { font-size: 11.5px; }
+.chip-busy { background: var(--accent-bg); color: var(--accent-ink); }
+.chip-stopped { background: transparent; border: 1px solid var(--line-strong); padding: 1px 7px; }
+.thread { display: flex; flex-direction: column; gap: 18px; }
+.msg { max-width: 640px; display: flex; flex-direction: column; gap: 6px; }
+.msg-in { align-self: flex-start; align-items: flex-start; }
+.msg-out { align-self: flex-end; align-items: flex-end; }
+.msg-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.msg-head b { color: var(--ink); font-weight: 500; }
+.msg-head .mono { font-size: 11.5px; color: var(--label); }
+.avatar { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--avatar); color: var(--ink); font-size: 10.5px; font-weight: 600; }
+.bubble { margin: 0; padding: 12px 14px; border-radius: 10px; font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; text-wrap: pretty; }
+.msg-in .bubble { background: var(--in-bg); border: 1px solid var(--line); }
+.msg-out .bubble { background: var(--out-bg); border: 1px solid var(--out-line); }
+.props { display: flex; flex-direction: column; gap: 6px; padding: 6px 14px 14px; }
+.props dl { margin: 0; display: grid; grid-template-columns: 92px minmax(0, 1fr); column-gap: 12px; align-items: baseline; }
+.props dt { padding: 8px 0; font-size: 12.5px; color: var(--label); }
+.props dd { margin: 0; padding: 8px 0; overflow-wrap: anywhere; }
+.props dd.mono { font-size: 12px; }
+.props .extra { display: block; font-size: 12px; color: var(--muted); }
+.props-actions { display: flex; flex-direction: column; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar" id="sidebar" aria-label="Sessions"></nav>
+  <main class="main">
+    <div class="topbar" id="topbar"></div>
+    <div class="content" id="content"></div>
+  </main>
+</div>
+
+<script>
+/* ==================================================================
+   Claude sessions dashboard. Data comes from /api/sessions (snapshot() in agents_dash.py).
+
+   Routes: #/ (overview)  ·  #/s/<session name> (session page)
+   ================================================================== */
+
+/**
+ * @typedef {Object} Message
+ * @property {string} [from]  sender name; 'you' when the user sent it (lastIn only)
+ * @property {number} at      epoch ms
+ * @property {string} text
+ *
+ * @typedef {Object} Session
+ * @property {string} name               full session name ('research-max-agent')
+ * @property {string} id                 name without the group prefix, unique ('max-agent')
+ * @property {string} group              'manager' | 'dev' | 'research' | …
+ * @property {'busy'|'idle'|'stopped'} state
+ * @property {number} stateSince         epoch ms the current state began
+ * @property {string} folder
+ * @property {string} sessionId          Claude session id (copied by "Copy ID")
+ * @property {string|null} runsIn        'Herdr', 'Desktop app', … (null when stopped)
+ * @property {number|null} startedAt     epoch ms the process started (null when stopped)
+ * @property {number|null} memoryMB
+ * @property {{count:number, memoryMB:number}|null} children   child processes
+ * @property {string|null} workingOn
+ * @property {Message|null} lastIn       latest message the session received
+ * @property {Message|null} lastOut      latest reply the session sent
+ * @property {string} resume             "Copy resume command" text
+ */
+
+const CONFIG = {
+  pollMs: 5000,
+  feedSize: 10,
+  groupOrder: ['manager', 'dev', 'research'],   // unknown groups go last, A–Z
+  resumeCommand: (s) => s.resume,   // built by the server: cd into the folder, then claude --resume
+};
+
+async function loadSessions() {
+  const res = await fetch('/api/sessions', { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+/* ---------- State ---------- */
+let sessions = [];
+let lastSignature = '';
+let lastUpdated = null;
+
+const $sidebar = document.getElementById('sidebar');
+const $topbar = document.getElementById('topbar');
+const $content = document.getElementById('content');
+
+/* ---------- Icons ---------- */
+const ICONS = {
+  grid: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+  chevron: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+  moon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
+  sun: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+  terminal: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M12.5 15H17"/></svg>',
+  copy: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>',
+  check: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+};
+
+function statusIcon(state, size = 14) {
+  const dash = state === 'stopped' ? ' stroke-dasharray="2.4 2.1"' : '';
+  const core = state === 'busy' ? '<circle class="core" cx="7" cy="7" r="2.6" fill="currentColor"/>' : '';
+  return `<svg class="si si-${state}" width="${size}" height="${size}" viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="5.75" fill="none" stroke="currentColor" stroke-width="1.5"${dash}/>${core}</svg>`;
+}
+
+/* ---------- Formatting ---------- */
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const secSince = (t) => Math.max(0, Math.floor((Date.now() - t) / 1000));
+const oneDecimal = (n) => String(Math.round(n * 10) / 10);
+const pad2 = (n) => String(n).padStart(2, '0');
+
+const FMT = {
+  // 1:39 · 1:02:07
+  clock: (s) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60; return h ? `${h}:${pad2(m)}:${pad2(r)}` : `${m}:${pad2(r)}`; },
+  // 12s · 16m · 3.4h · 2d
+  short: (s) => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${oneDecimal(s / 3600)}h` : `${Math.floor(s / 86400)}d`,
+  // 12 s · 16 min · 3.4 h · 2 d
+  long: (s) => s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86400 ? `${oneDecimal(s / 3600)} h` : `${oneDecimal(s / 86400)} d`,
+  ago: (s) => `${FMT.long(s)} ago`,
+};
+
+// A time that keeps itself current: tick() below rewrites every [data-tick] once a second.
+const live = (kind, at) => `<span data-tick="${kind}" data-at="${at}">${FMT[kind](secSince(at))}</span>`;
+
+function tickAll() {
+  document.querySelectorAll('[data-tick]').forEach((el) => {
+    const next = FMT[el.dataset.tick](secSince(Number(el.dataset.at)));
+    if (el.textContent !== next) el.textContent = next;
   });
-  if (!reduce.matches) entering.forEach((e, i) => e.animate(
-    [{ opacity: 0, transform: "translateY(10px)" }, { opacity: 1, transform: "none" }],
-    { duration: 420, delay: firstRender ? i * 45 : 0, easing: "cubic-bezier(.2, .75, .25, 1)", fill: "backwards" }));
-  firstRender = false;
 }
 
-function leave(el) {
-  el.dataset.leaving = "1";
-  const done = () => flip(() => el.remove());
-  if (reduce.matches) return done();
-  el.animate([{ opacity: 1 }, { opacity: 0, transform: "scale(.98)" }], { duration: 220, fill: "forwards" }).onfinish = done;
+const senderLabel = (from) => (from === 'you' ? 'You' : from);
+const shortId = (id) => (id && id.length > 8 ? `${id.slice(0, 8)}…` : id || '—');
+const memText = (s) => (s.memoryMB == null ? '—' : `${s.memoryMB} MB`);
+const childText = (s) => (s.children ? `+${s.children.memoryMB} MB in ${s.children.count} child process${s.children.count === 1 ? '' : 'es'}` : '');
+const upText = (s) => (s.startedAt ? `up ${live('long', s.startedAt)}` : 'up —');
+
+// Status time with an optional word: "busy 1:39", "idle 16m", "off 42m"
+function stateTime(s, withWord) {
+  if (s.state === 'busy') return `<span class="is-busy">${withWord ? 'busy ' : ''}${live('clock', s.stateSince)}</span>`;
+  if (s.state === 'idle') return `<span>${withWord ? 'idle ' : ''}${live('short', s.stateSince)}</span>`;
+  return `<span>off ${live('short', s.stateSince)}</span>`;
 }
 
-let recentKey = "";
-function renderRecent(list, ready) {
-  if (!ready) return setText(document.getElementById("recentCount"), "Loading");
-  setText(document.getElementById("recentCount"), list.length ? `${list.length} in the last 7 days` : "none in the last 7 days");
-  const key = JSON.stringify(list.map(r => [r.sessionId, r.name, r.lastActivity, r.request && r.request.text]));
-  if (key === recentKey) return;
-  recentKey = key;
-  document.getElementById("recent").replaceChildren(...list.map(r => {
-    const row = $("div", "row");
-    const left = $("div"); left.append($("div", "rname", r.name),
-      $("div", "rmeta mono", `${since(r.lastActivity)} ago in ${r.cwd || "?"}`));
-    const req = $("div", "rreq mono", r.request ? (r.request.from ? `Message from ${r.request.from}: ` : "") + r.request.text : "");
-    const a = $("div", "actions");
-    const id = copyButton("Copy ID"); id.dataset.value = r.sessionId;
-    const res = copyButton("Copy resume command"); res.dataset.value = r.resume;
-    a.append(id, res); row.append(left, req, a); return row;
-  }));
+function latest(s) {
+  const a = s.lastIn, b = s.lastOut;
+  if (!a && !b) return null;
+  if (b && (!a || b.at >= a.at)) return { dir: 'out', who: s.id, verb: 'replied', at: b.at, text: b.text };
+  return { dir: 'in', who: senderLabel(a.from), verb: a.from === 'you' ? 'asked' : 'sent a message', at: a.at, text: a.text };
 }
 
+/* ---------- Derived data ---------- */
+const STATE_RANK = { busy: 0, idle: 1, stopped: 2 };
+const bySessionOrder = (a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || b.stateSince - a.stateSince;
+const groupRank = (g) => { const i = CONFIG.groupOrder.indexOf(g); return i < 0 ? 999 : i; };
+
+function grouped() {
+  const names = [...new Set(sessions.map((s) => s.group))].sort((a, b) => groupRank(a) - groupRank(b) || a.localeCompare(b));
+  return names.map((name) => {
+    const items = sessions.filter((s) => s.group === name).sort(bySessionOrder);
+    const busy = items.filter((s) => s.state === 'busy').length;
+    const allStopped = items.every((s) => s.state === 'stopped');
+    return { name, items, summary: allStopped ? 'not running' : busy ? `${busy} busy` : 'all idle' };
+  });
+}
+
+function counts() {
+  const c = { busy: 0, idle: 0, stopped: 0 };
+  sessions.forEach((s) => { c[s.state] += 1; });
+  return c;
+}
+
+function feedEvents() {
+  const ev = [];
+  sessions.forEach((s) => {
+    if (s.lastIn) ev.push({ s, dir: 'in', at: s.lastIn.at, from: senderLabel(s.lastIn.from), text: s.lastIn.text });
+    if (s.lastOut) ev.push({ s, dir: 'out', at: s.lastOut.at, text: s.lastOut.text });
+  });
+  return ev.sort((a, b) => b.at - a.at).slice(0, CONFIG.feedSize);
+}
+
+/* ---------- Routing ---------- */
+function route() {
+  const m = location.hash.match(/^#\/s\/(.+)$/);
+  if (m) {
+    const id = decodeURIComponent(m[1]);
+    if (sessions.some((s) => s.id === id)) return { view: 'session', id };
+  }
+  return { view: 'home', id: null };
+}
+const sessionHref = (s) => `#/s/${encodeURIComponent(s.id)}`;
+
+/* ---------- Render: sidebar ---------- */
+function renderSidebar(r) {
+  let h = `
+    <div class="brand">
+      <span class="brand-name">Claude sessions</span>
+      <span class="live mono" title="Last refreshed"><span class="live-dot" aria-hidden="true"></span><span id="updated">${esc(lastUpdated ? lastUpdated.toLocaleTimeString() : '')}</span></span>
+    </div>
+    <a class="nav-link" href="#/"${r.view === 'home' ? ' aria-current="page"' : ''}>${ICONS.grid}<span>Overview</span></a>`;
+
+  grouped().forEach((g) => {
+    h += `<div class="nav-group"><div class="nav-group-head"><span>${esc(g.name)}</span><span class="mono">${g.items.length}</span></div>`;
+    g.items.forEach((s) => {
+      const l = latest(s);
+      const preview = l ? (l.dir === 'out' ? l.text : `${l.who}: ${l.text}`) : '';
+      h += `
+        <a class="nav-item" href="${sessionHref(s)}"${r.id === s.id ? ' aria-current="page"' : ''}>
+          ${statusIcon(s.state)}
+          <span class="name">${esc(s.id)}</span>
+          <span class="time mono">${stateTime(s, false)}</span>
+          <span class="preview">${esc(preview)}</span>
+        </a>`;
+    });
+    h += `</div>`;
+  });
+  $sidebar.innerHTML = h;
+}
+
+/* ---------- Render: top bar ---------- */
+function renderTopbar(r) {
+  const c = counts();
+  const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  let crumbs;
+  if (r.view === 'session') {
+    const s = sessions.find((x) => x.id === r.id);
+    crumbs = `<a href="#/">Overview</a><span class="sep">${ICONS.chevron}</span><span class="dim">${esc(s.group)}</span><span class="sep">${ICONS.chevron}</span><span class="here">${esc(s.id)}</span>`;
+  } else {
+    crumbs = `<span class="here">Overview</span>`;
+  }
+  $topbar.innerHTML = `
+    <nav class="crumbs" aria-label="Breadcrumb">${crumbs}</nav>
+    <div class="topbar-right">
+      <div class="counts">
+        <span>${statusIcon('busy', 12)}<span><b>${c.busy}</b> busy</span></span>
+        <span>${statusIcon('idle', 12)}<span><b>${c.idle}</b> idle</span></span>
+        <span>${statusIcon('stopped', 12)}<span><b>${c.stopped}</b> not running</span></span>
+      </div>
+      <button type="button" class="icon-btn" data-action="theme" aria-label="${dark ? 'Switch to light mode' : 'Switch to dark mode'}" title="${dark ? 'Light mode' : 'Dark mode'}">${dark ? ICONS.sun : ICONS.moon}</button>
+    </div>`;
+}
+
+/* ---------- Render: overview ---------- */
+function copyButtons(s, block) {
+  const cls = block ? ' btn-block' : '';
+  return {
+    cmd: `<button type="button" class="btn btn-primary${cls}" data-copy="cmd" data-id="${esc(s.id)}">${ICONS.terminal}Copy resume command</button>`,
+    id: `<button type="button" class="btn${cls}" data-copy="id" data-id="${esc(s.id)}">${ICONS.copy}Copy ID</button>`,
+  };
+}
+
+function renderHome() {
+  const busy = sessions.filter((s) => s.state === 'busy').sort(bySessionOrder);
+  const stopped = sessions.filter((s) => s.state === 'stopped');
+  const groups = grouped();
+
+  const banners = stopped.map((s) => `
+    <div class="panel banner">
+      <div class="banner-text">${statusIcon('stopped')}<span><b style="font-weight:500">${esc(s.id)}</b><span class="dim"> is not running · off for ${live('long', s.stateSince)}</span></span></div>
+      <div class="actions"><a class="btn" href="${sessionHref(s)}">View</a>${copyButtons(s).cmd}</div>
+    </div>`).join('');
+
+  const workCards = busy.length ? `<div class="work-grid">${busy.map((s) => {
+    const l = latest(s);
+    return `
+      <a class="panel work-card" href="${sessionHref(s)}">
+        <span class="work-top">${statusIcon('busy')}<span class="name">${esc(s.id)}</span><span class="timer mono">${stateTime(s, true)}</span></span>
+        <span class="meta mono"><span>${esc(s.group)}</span><span>${esc(s.runsIn || '—')}</span><span>${upText(s)}</span><span>${esc(memText(s))}</span></span>
+        ${l ? `<span class="last"><span class="last-head"><b>${esc(l.who)}</b> ${l.verb} · ${live('ago', l.at)}</span><span class="clamp2">${esc(l.text)}</span></span>` : ''}
+      </a>`;
+  }).join('')}</div>` : `<div class="panel empty">Nothing is running right now.</div>`;
+
+  const groupRows = groups.map((g) => `
+    <div class="group">
+      <div class="group-head"><span><span class="name">${esc(g.name)}</span><span class="count mono">${g.items.length}</span></span><span class="summary">${g.summary}</span></div>
+      ${g.items.map((s) => `
+        <a class="row" href="${sessionHref(s)}">
+          <span class="row-name">${statusIcon(s.state)}<span>${esc(s.id)}</span></span>
+          <span class="row-meta mono">
+            <span class="w-runs">${esc(s.runsIn || '—')}</span>
+            <span class="w-up">${upText(s)}</span>
+            <span class="w-mem">${esc(memText(s))}</span>
+            <span class="w-state">${stateTime(s, true)}</span>
+          </span>
+        </a>`).join('')}
+    </div>`).join('');
+
+  const feed = feedEvents().map((e) => `
+    <li><a href="${sessionHref(e.s)}">
+      <span class="ago mono">${live('short', e.at)}</span>
+      <span class="body">
+        <span class="who">${e.dir === 'out' ? `<b>${esc(e.s.id)}</b><i> replied</i>` : `<b>${esc(e.from)}</b><i> to </i><b>${esc(e.s.id)}</b>`}</span>
+        <span class="text">${esc(e.text)}</span>
+      </span>
+    </a></li>`).join('');
+
+  $content.innerHTML = `
+    <div class="page">
+      <div>
+        <h1 class="h1">Overview</h1>
+        <p class="sub">${sessions.length} sessions in ${groups.length} groups · ${busy.length} working right now</p>
+      </div>
+      ${banners}
+      <div class="cols">
+        <div class="col-main">
+          <section class="section" aria-labelledby="h-working">
+            <h2 class="label" id="h-working"><span>Working now</span><span class="mono">${busy.length}</span></h2>
+            ${workCards}
+          </section>
+          <section class="section" aria-labelledby="h-groups">
+            <h2 class="label" id="h-groups"><span>Groups</span><span class="mono">${groups.length}</span></h2>
+            <div class="panel groups">${groupRows}</div>
+          </section>
+        </div>
+        <section class="col-side" aria-labelledby="h-activity">
+          <h2 class="label" id="h-activity">Recent activity</h2>
+          <ol class="panel feed">${feed}</ol>
+        </section>
+      </div>
+    </div>`;
+  document.title = 'Claude sessions';
+}
+
+/* ---------- Render: session ---------- */
+function renderSession(id) {
+  const s = sessions.find((x) => x.id === id);
+  const chip = s.state === 'busy'
+    ? `<span class="chip chip-busy"><span>Busy</span><span class="mono">${live('clock', s.stateSince)}</span></span>`
+    : s.state === 'idle'
+      ? `<span class="chip"><span>Idle for</span><span class="mono">${live('long', s.stateSince)}</span></span>`
+      : `<span class="chip chip-stopped"><span>Not running for</span><span class="mono">${live('long', s.stateSince)}</span></span>`;
+
+  const msgs = [];
+  if (s.lastIn) msgs.push({ dir: 'in', at: s.lastIn.at, who: senderLabel(s.lastIn.from), verb: s.lastIn.from === 'you' ? 'asked' : 'sent a message', text: s.lastIn.text });
+  if (s.lastOut) msgs.push({ dir: 'out', at: s.lastOut.at, who: s.id, verb: 'replied', text: s.lastOut.text });
+  msgs.sort((a, b) => a.at - b.at);
+
+  const thread = msgs.length ? msgs.map((m) => m.dir === 'in' ? `
+      <article class="msg msg-in">
+        <div class="msg-head"><span class="avatar" aria-hidden="true">${esc(m.who.charAt(0).toUpperCase())}</span><span><b>${esc(m.who)}</b> ${m.verb}</span><span class="mono">${live('ago', m.at)}</span></div>
+        <p class="bubble">${esc(m.text)}</p>
+      </article>` : `
+      <article class="msg msg-out">
+        <div class="msg-head"><span><b>${esc(m.who)}</b> ${m.verb}</span><span class="mono">${live('ago', m.at)}</span></div>
+        <p class="bubble">${esc(m.text)}</p>
+      </article>`).join('') : `<div class="panel empty">No messages yet.</div>`;
+
+  const btns = copyButtons(s, true);
+  $content.innerHTML = `
+    <div class="page">
+      <div class="title-row">${statusIcon(s.state, 18)}<h1 class="h1" style="font-size:24px;letter-spacing:-0.02em">${esc(s.id)}</h1>${chip}</div>
+      <div class="cols">
+        <section class="section" style="flex:999 1 420px;min-width:0" aria-labelledby="h-exchange">
+          <h2 class="label" id="h-exchange">Latest exchange</h2>
+          <div class="thread">${thread}</div>
+        </section>
+        <aside class="section" style="flex:1 1 280px;min-width:0" aria-labelledby="h-props">
+          <h2 class="label" id="h-props">Properties</h2>
+          <div class="panel props">
+            <dl>
+              <dt>Folder</dt><dd class="mono">${esc(s.folder)}</dd>
+              <dt>Session</dt><dd class="mono" title="${esc(s.sessionId)}">${esc(shortId(s.sessionId))}</dd>
+              <dt>Runs in</dt><dd>${esc(s.runsIn || '—')}</dd>
+              <dt>Running for</dt><dd>${s.startedAt ? live('long', s.startedAt) : '—'}</dd>
+              <dt>Memory</dt><dd>${esc(memText(s))}${s.children ? `<span class="extra">${esc(childText(s))}</span>` : ''}</dd>
+              <dt>Working on</dt><dd>${esc(s.workingOn || '—')}</dd>
+            </dl>
+            <div class="props-actions">${btns.cmd}${btns.id}</div>
+          </div>
+        </aside>
+      </div>
+    </div>`;
+  document.title = `${s.id} · Claude sessions`;
+}
+
+/* ---------- Render: all ---------- */
+function render() {
+  const r = route();
+  renderSidebar(r);
+  renderTopbar(r);
+  if (r.view === 'session') renderSession(r.id); else renderHome();
+}
+
+/* ---------- Data refresh ---------- */
 async function refresh() {
-  const live = document.getElementById("live"), banner = document.getElementById("banner");
   try {
-    const r = await fetch("/api/sessions", { cache: "no-store" });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
-    render(d.running);
-    renderRecent(d.recent, d.recentReady);
-    const n = st => d.running.filter(s => s.status === st).length;
-    const busy = n("busy"), idle = n("idle"), shell = n("shell"), other = d.running.length - busy - idle - shell;
-    const counts = document.getElementById("counts");
-    if (!d.running.length) setText(counts, "Nothing running on this machine");
-    else {
-      const part = (cls, text) => { const b = $("b", cls, text); return b; };
-      const parts = [part("n-busy", busy + " busy"), part(null, idle + " idle")];
-      if (shell) parts.push(part(null, shell + " in a shell"));
-      if (other) parts.push(part(null, other + " other"));
-      counts.replaceChildren(...parts.flatMap((p, i) => i ? [document.createTextNode(", "), p] : [p]));
+    const data = await loadSessions();
+    lastUpdated = new Date();
+    const sig = JSON.stringify(data);
+    if (sig !== lastSignature) {   // only re-render when something changed
+      lastSignature = sig;
+      sessions = data;
+      render();
+    } else {
+      const el = document.getElementById('updated');
+      if (el) el.textContent = lastUpdated.toLocaleTimeString();
     }
-    live.classList.remove("off");
-    setText(document.getElementById("liveText"), "Live, updated " + new Date().toLocaleTimeString());
-    banner.classList.remove("show");
-  } catch (e) {
-    live.classList.add("off");
-    setText(document.getElementById("liveText"), "Offline");
-    banner.textContent = "Can't reach the dashboard server. Start it again with agents-dash, then this page reconnects on its own.";
-    banner.classList.add("show");
+  } catch (err) {
+    console.error('Failed to load sessions', err);
   }
 }
 
-setInterval(() => cards.forEach(tickCard), 1000);
-setInterval(refresh, 2000);
+/* ---------- Events ---------- */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e2) {}
+    ta.remove();
+  }
+}
+
+document.addEventListener('click', async (e) => {
+  const copyBtn = e.target.closest('[data-copy]');
+  if (copyBtn) {
+    const s = sessions.find((x) => x.id === copyBtn.dataset.id);
+    if (!s) return;
+    await copyText(copyBtn.dataset.copy === 'cmd' ? CONFIG.resumeCommand(s) : s.sessionId);
+    const original = copyBtn.innerHTML;
+    copyBtn.innerHTML = `${ICONS.check}Copied`;
+    setTimeout(() => { if (copyBtn.isConnected) copyBtn.innerHTML = original; }, 1400);
+    return;
+  }
+  if (e.target.closest('[data-action="theme"]')) {
+    const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('sessions-theme', next); } catch (err) {}
+    renderTopbar(route());
+  }
+});
+
+window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
+
 refresh();
-</script></body></html>"""
+setInterval(refresh, CONFIG.pollMs);
+setInterval(tickAll, 1000);
+</script>
+</body>
+</html>"""
 
 
 def main():
